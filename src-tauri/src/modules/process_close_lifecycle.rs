@@ -2322,6 +2322,44 @@ pub fn start_codex_with_args_and_env_and_egress(
             );
         }
 
+        // Store clients can be created successfully outside their package but fail
+        // during bootstrap. Do not wait for a CreateProcess error to activate them
+        // with package identity. Keep the configured executable as the PID match target.
+        if is_windowsapps_launch_path(&resolved_launch_path) {
+            let package_launch_path = refresh_registered_codex_store_launch_path(&resolved_launch_path)
+                .unwrap_or_else(|| resolved_launch_path.clone());
+            if package_launch_path != resolved_launch_path {
+                update_app_path_in_config(
+                    "codex",
+                    &package_launch_path,
+                    &resolved_launch_path.to_string_lossy(),
+                );
+            }
+            launch_codex_via_package_identity(
+                &package_launch_path,
+                codex_home_trimmed,
+                &app_user_data_dir,
+                extra_args,
+                &effective_extra_env,
+            )?;
+            let probe_started = Instant::now();
+            while probe_started.elapsed() < Duration::from_secs(15) {
+                if let Some(pid) = resolve_codex_pid(None, Some(codex_home_trimmed)) {
+                    thread::sleep(Duration::from_millis(500));
+                    if is_pid_running(pid)
+                        && resolve_codex_pid(Some(pid), Some(codex_home_trimmed)) == Some(pid)
+                    {
+                        crate::modules::logger::log_info(&format!(
+                            "[Codex Start] managed Store package activation confirmed: pid={}", pid
+                        ));
+                        return Ok(pid);
+                    }
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            return Err("Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程".to_string());
+        }
+
         // 启动路径可能在自动修复后与初始配置不同（商店包更新会换目录），
         // 后续日志、PowerShell 兜底与诊断信息都使用实际尝试的路径。
         let (launch_path, spawn_result) = launch_windows_codex_instance(

@@ -1,5 +1,29 @@
 // Process 模块测试：平台路径、Codex 启动参数和进程清理行为。
 // 保持测试模块位于原作用域，super 引用和 cfg 条件不变。
+#[cfg(all(test, target_os = "windows"))]
+mod local_store_login_smoke_tests {
+    #[test]
+    #[ignore = "opens an isolated installed Codex desktop; run explicitly on Windows"]
+    fn managed_store_login_survives_bootstrap() {
+        let profile = std::env::temp_dir()
+            .join(format!("cockpit-store-smoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&profile).expect("create isolated test profile");
+        std::fs::write(profile.join("config.toml"), "cli_auth_credentials_store = \"file\"\n")
+            .expect("write isolated configuration");
+        let home = profile.to_string_lossy().to_string();
+        let pid = super::start_codex_with_args(&home, &[])
+            .expect("Store client must start with package identity");
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        let live_pid = super::resolve_codex_pid(Some(pid), Some(&home));
+        let running = super::is_pid_running(pid);
+        let cleanup = super::close_codex_instances(&[home], 10);
+        assert!(running, "Store client exited during bootstrap");
+        assert_eq!(live_pid, Some(pid), "PID must belong to the isolated profile");
+        cleanup.expect("close only the isolated test instance");
+        assert!(!profile.join("auth.json").exists(), "test must not use real credentials");
+    }
+}
+
 #[cfg(test)]
 mod legacy_platform_adapter_cleanup_tests {
     use super::{orphaned_legacy_platform_adapter_pid_from_ps_line, utf8_command_output_snippet};
