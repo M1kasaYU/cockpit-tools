@@ -2184,6 +2184,56 @@ fn collect_new_codex_profile_pids(
         .collect()
 }
 
+/// 等待包身份启动的实例就绪；探测失败时仅清理本次新启动的目标实例。
+#[cfg(target_os = "windows")]
+fn wait_for_codex_package_activation(
+    launch_path: &Path,
+    codex_home: &str,
+    app_user_data_dir: &Path,
+    existing_pids: &HashSet<u32>,
+    probe_pid: impl Fn(Option<u32>, Option<&str>) -> Option<u32>,
+) -> Result<u32, String> {
+    let probe_started = Instant::now();
+    while probe_started.elapsed() < Duration::from_secs(15) {
+        if let Some(pid) = probe_pid(None, Some(codex_home)) {
+            thread::sleep(Duration::from_millis(500));
+            if is_pid_running(pid) && probe_pid(Some(pid), Some(codex_home)) == Some(pid) {
+                crate::modules::logger::log_info(&format!(
+                    "[Codex Start] managed Store package activation confirmed: pid={}",
+                    pid
+                ));
+                return Ok(pid);
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let new_profile_pids = collect_new_codex_profile_pids(
+        &collect_codex_process_entries(),
+        existing_pids,
+        app_user_data_dir,
+    );
+    crate::modules::logger::log_warn(&format!(
+        "[Codex Start] managed Store activation timed out without a stable matching PID: launch_path={} codex_home={} cleanup_pids={}",
+        launch_path.to_string_lossy(),
+        summarize_text_for_process_log(codex_home, 96),
+        summarize_pid_list_for_log(&new_profile_pids)
+    ));
+    let cleanup_result = close_pids(&new_profile_pids, 10);
+    if let Err(error) = cleanup_result.as_ref() {
+        crate::modules::logger::log_warn(&format!(
+            "[Codex Start] failed to close newly launched Store client after timeout: {}",
+            error
+        ));
+    }
+    Err(match cleanup_result {
+        Ok(()) => "Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程".to_string(),
+        Err(error) => format!(
+            "Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程；清理新启动进程失败: {}",
+            error
+        ),
+    })
+}
+
 /// 启动 Codex 桌面实例（支持独立 CODEX_HOME、Electron user-data 与附加参数）。
 pub fn start_codex_with_args(codex_home: &str, extra_args: &[String]) -> Result<u32, String> {
     start_codex_with_args_and_env(codex_home, extra_args, &[])
@@ -2366,47 +2416,13 @@ pub fn start_codex_with_args_and_env_and_egress(
                 extra_args,
                 &effective_extra_env,
             )?;
-            let probe_started = Instant::now();
-            while probe_started.elapsed() < Duration::from_secs(15) {
-                if let Some(pid) = resolve_codex_pid(None, Some(codex_home_trimmed)) {
-                    thread::sleep(Duration::from_millis(500));
-                    if is_pid_running(pid)
-                        && resolve_codex_pid(Some(pid), Some(codex_home_trimmed)) == Some(pid)
-                    {
-                        crate::modules::logger::log_info(&format!(
-                            "[Codex Start] managed Store package activation confirmed: pid={}",
-                            pid
-                        ));
-                        return Ok(pid);
-                    }
-                }
-                thread::sleep(Duration::from_millis(250));
-            }
-            let new_profile_pids = collect_new_codex_profile_pids(
-                &collect_codex_process_entries(),
-                &existing_pids,
+            return wait_for_codex_package_activation(
+                &package_launch_path,
+                codex_home_trimmed,
                 &app_user_data_dir,
+                &existing_pids,
+                resolve_codex_pid,
             );
-            crate::modules::logger::log_warn(&format!(
-                "[Codex Start] managed Store activation timed out without a stable matching PID: launch_path={} codex_home={} cleanup_pids={}",
-                package_launch_path.to_string_lossy(),
-                summarize_text_for_process_log(codex_home_trimmed, 96),
-                summarize_pid_list_for_log(&new_profile_pids)
-            ));
-            let cleanup_result = close_pids(&new_profile_pids, 10);
-            if let Err(error) = cleanup_result.as_ref() {
-                crate::modules::logger::log_warn(&format!(
-                    "[Codex Start] failed to close newly launched Store client after timeout: {}",
-                    error
-                ));
-            }
-            return Err(match cleanup_result {
-                Ok(()) => "Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程".to_string(),
-                Err(error) => format!(
-                    "Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程；清理新启动进程失败: {}",
-                    error
-                ),
-            });
         }
 
         // 启动路径可能在自动修复后与初始配置不同（商店包更新会换目录），
