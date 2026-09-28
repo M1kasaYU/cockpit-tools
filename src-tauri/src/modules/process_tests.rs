@@ -17,9 +17,9 @@ mod local_store_login_smoke_tests {
         let live_pid = super::resolve_codex_pid(Some(pid), Some(&home));
         let running = super::is_pid_running(pid);
         let cleanup = super::close_codex_instances(&[home], 10);
+        cleanup.expect("close only the isolated test instance");
         assert!(running, "Store client exited during bootstrap");
         assert_eq!(live_pid, Some(pid), "PID must belong to the isolated profile");
-        cleanup.expect("close only the isolated test instance");
         assert!(!profile.join("auth.json").exists(), "test must not use real credentials");
     }
 }

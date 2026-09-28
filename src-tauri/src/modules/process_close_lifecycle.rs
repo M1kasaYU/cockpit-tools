@@ -2335,6 +2335,10 @@ pub fn start_codex_with_args_and_env_and_egress(
                     &resolved_launch_path.to_string_lossy(),
                 );
             }
+            let existing_pids: HashSet<u32> = collect_codex_process_entries()
+                .into_iter()
+                .map(|(pid, _)| pid)
+                .collect();
             launch_codex_via_package_identity(
                 &package_launch_path,
                 codex_home_trimmed,
@@ -2357,7 +2361,30 @@ pub fn start_codex_with_args_and_env_and_egress(
                 }
                 thread::sleep(Duration::from_millis(250));
             }
-            return Err("Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程".to_string());
+            let target_dir = normalize_path_for_compare(&app_user_data_dir.to_string_lossy());
+            let new_profile_pids: Vec<u32> = collect_codex_process_entries()
+                .into_iter()
+                .filter_map(|(pid, dir)| {
+                    let dir = dir?;
+                    (!existing_pids.contains(&pid)
+                        && normalize_path_for_compare(&dir) == target_dir)
+                        .then_some(pid)
+                })
+                .collect();
+            let cleanup_result = close_pids(&new_profile_pids, 10);
+            if let Err(error) = cleanup_result.as_ref() {
+                crate::modules::logger::log_warn(&format!(
+                    "[Codex Start] failed to close newly launched Store client after timeout: {}",
+                    error
+                ));
+            }
+            return Err(match cleanup_result {
+                Ok(()) => "Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程".to_string(),
+                Err(error) => format!(
+                    "Codex 程序包已激活，但未找到稳定运行且匹配登录目录的客户端进程；清理新启动进程失败: {}",
+                    error
+                ),
+            });
         }
 
         // 启动路径可能在自动修复后与初始配置不同（商店包更新会换目录），
