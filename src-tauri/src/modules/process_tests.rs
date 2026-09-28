@@ -1,26 +1,117 @@
 // Process 模块测试：平台路径、Codex 启动参数和进程清理行为。
 // 保持测试模块位于原作用域，super 引用和 cfg 条件不变。
+#[cfg(test)]
+mod codex_store_timeout_cleanup_tests {
+    use super::collect_new_codex_profile_pids;
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    #[test]
+    fn selects_only_new_processes_in_the_requested_profile() {
+        let entries = vec![
+            (10, Some("/profiles/login".to_string())),
+            (11, Some("/profiles/login".to_string())),
+            (12, Some("/profiles/other".to_string())),
+            (13, None),
+            (14, Some(String::new())),
+            (15, Some("/profiles/login-backup".to_string())),
+            (16, Some("  ".to_string())),
+        ];
+        let existing_pids = HashSet::from([10]);
+        assert_eq!(
+            collect_new_codex_profile_pids(&entries, &existing_pids, Path::new("/profiles/login")),
+            vec![11]
+        );
+    }
+
+    #[test]
+    fn preserves_all_preexisting_processes_even_when_the_directory_now_matches() {
+        let entries = vec![(10, Some("/profiles/login".to_string()))];
+        assert!(collect_new_codex_profile_pids(
+            &entries,
+            &HashSet::from([10]),
+            Path::new("/profiles/login")
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn rejects_an_empty_target_directory() {
+        let entries = vec![(10, None), (11, Some(String::new()))];
+        assert!(
+            collect_new_codex_profile_pids(&entries, &HashSet::new(), Path::new("")).is_empty()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn matches_windows_directory_case_and_separator_variants() {
+        let entries = vec![(10, Some("c:/profiles/Login".to_string()))];
+        assert_eq!(
+            collect_new_codex_profile_pids(
+                &entries,
+                &HashSet::new(),
+                Path::new(r"C:\Profiles\login")
+            ),
+            vec![10]
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod local_store_login_smoke_tests {
     #[test]
     #[ignore = "opens an isolated installed Codex desktop; run explicitly on Windows"]
     fn managed_store_login_survives_bootstrap() {
-        let profile = std::env::temp_dir()
-            .join(format!("cockpit-store-smoke-{}", uuid::Uuid::new_v4()));
+        let launch_path =
+            super::resolve_codex_launch_path().expect("resolve installed Store client");
+        assert!(
+            super::is_windowsapps_launch_path(&launch_path),
+            "this test requires an installed Windows Store Codex client"
+        );
+        let profile =
+            std::env::temp_dir().join(format!("cockpit-store-smoke-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&profile).expect("create isolated test profile");
-        std::fs::write(profile.join("config.toml"), "cli_auth_credentials_store = \"file\"\n")
-            .expect("write isolated configuration");
+        let app_user_data_dir =
+            crate::modules::codex_instance::get_windows_app_user_data_dir(&profile)
+                .expect("resolve isolated app runtime directory");
+        assert!(
+            !app_user_data_dir.exists(),
+            "test runtime must be a new directory"
+        );
+        std::fs::write(
+            profile.join("config.toml"),
+            "cli_auth_credentials_store = \"file\"\n",
+        )
+        .expect("write isolated configuration");
         let home = profile.to_string_lossy().to_string();
-        let pid = super::start_codex_with_args(&home, &[])
-            .expect("Store client must start with package identity");
-        std::thread::sleep(std::time::Duration::from_secs(8));
-        let live_pid = super::resolve_codex_pid(Some(pid), Some(&home));
-        let running = super::is_pid_running(pid);
+        let launch_result = super::start_codex_with_args(&home, &[]);
+        let (running, live_pid) = match launch_result.as_ref() {
+            Ok(pid) => {
+                std::thread::sleep(std::time::Duration::from_secs(8));
+                (
+                    super::is_pid_running(*pid),
+                    super::resolve_codex_pid(Some(*pid), Some(&home)),
+                )
+            }
+            Err(_) => (false, None),
+        };
+        let auth_file_written = profile.join("auth.json").exists();
         let cleanup = super::close_codex_instances(&[home], 10);
         cleanup.expect("close only the isolated test instance");
+        if app_user_data_dir.exists() {
+            std::fs::remove_dir_all(&app_user_data_dir)
+                .expect("remove isolated app runtime directory");
+        }
+        std::fs::remove_dir_all(&profile).expect("remove isolated test profile");
+        let pid = launch_result.expect("Store client must start with package identity");
         assert!(running, "Store client exited during bootstrap");
-        assert_eq!(live_pid, Some(pid), "PID must belong to the isolated profile");
-        assert!(!profile.join("auth.json").exists(), "test must not use real credentials");
+        assert_eq!(
+            live_pid,
+            Some(pid),
+            "PID must belong to the isolated profile"
+        );
+        assert!(!auth_file_written, "test must not use real credentials");
     }
 }
 

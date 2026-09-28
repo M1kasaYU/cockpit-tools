@@ -2170,6 +2170,20 @@ pub fn is_codex_running() -> bool {
     }
 }
 
+/// 仅选择本次新启动且明确属于目标目录的进程，避免超时清理误关已有实例。
+#[cfg(any(test, target_os = "windows"))]
+fn collect_new_codex_profile_pids(
+    entries: &[(u32, Option<String>)],
+    existing_pids: &HashSet<u32>,
+    app_user_data_dir: &Path,
+) -> Vec<u32> {
+    let target_dir = normalize_path_for_compare(&app_user_data_dir.to_string_lossy());
+    collect_matching_pids_by_user_data_dir(entries, &target_dir, false)
+        .into_iter()
+        .filter(|pid| !existing_pids.contains(pid))
+        .collect()
+}
+
 /// 启动 Codex 桌面实例（支持独立 CODEX_HOME、Electron user-data 与附加参数）。
 pub fn start_codex_with_args(codex_home: &str, extra_args: &[String]) -> Result<u32, String> {
     start_codex_with_args_and_env(codex_home, extra_args, &[])
@@ -2322,12 +2336,12 @@ pub fn start_codex_with_args_and_env_and_egress(
             );
         }
 
-        // Store clients can be created successfully outside their package but fail
-        // during bootstrap. Do not wait for a CreateProcess error to activate them
-        // with package identity. Keep the configured executable as the PID match target.
+        // 包外直启可能成功创建进程，但客户端随后因缺少程序包身份退出。
+        // 对商店客户端优先走包身份启动，避免仅在 CreateProcess 失败时才触发后备路径。
         if is_windowsapps_launch_path(&resolved_launch_path) {
-            let package_launch_path = refresh_registered_codex_store_launch_path(&resolved_launch_path)
-                .unwrap_or_else(|| resolved_launch_path.clone());
+            let package_launch_path =
+                refresh_registered_codex_store_launch_path(&resolved_launch_path)
+                    .unwrap_or_else(|| resolved_launch_path.clone());
             if package_launch_path != resolved_launch_path {
                 update_app_path_in_config(
                     "codex",
@@ -2339,6 +2353,12 @@ pub fn start_codex_with_args_and_env_and_egress(
                 .into_iter()
                 .map(|(pid, _)| pid)
                 .collect();
+            crate::modules::logger::log_info(&format!(
+                "[Codex Start] managed Store package activation: launch_path={} codex_home={} app_user_data_dir={}",
+                package_launch_path.to_string_lossy(),
+                summarize_text_for_process_log(codex_home_trimmed, 96),
+                app_user_data_dir.to_string_lossy()
+            ));
             launch_codex_via_package_identity(
                 &package_launch_path,
                 codex_home_trimmed,
@@ -2354,23 +2374,25 @@ pub fn start_codex_with_args_and_env_and_egress(
                         && resolve_codex_pid(Some(pid), Some(codex_home_trimmed)) == Some(pid)
                     {
                         crate::modules::logger::log_info(&format!(
-                            "[Codex Start] managed Store package activation confirmed: pid={}", pid
+                            "[Codex Start] managed Store package activation confirmed: pid={}",
+                            pid
                         ));
                         return Ok(pid);
                     }
                 }
                 thread::sleep(Duration::from_millis(250));
             }
-            let target_dir = normalize_path_for_compare(&app_user_data_dir.to_string_lossy());
-            let new_profile_pids: Vec<u32> = collect_codex_process_entries()
-                .into_iter()
-                .filter_map(|(pid, dir)| {
-                    let dir = dir?;
-                    (!existing_pids.contains(&pid)
-                        && normalize_path_for_compare(&dir) == target_dir)
-                        .then_some(pid)
-                })
-                .collect();
+            let new_profile_pids = collect_new_codex_profile_pids(
+                &collect_codex_process_entries(),
+                &existing_pids,
+                &app_user_data_dir,
+            );
+            crate::modules::logger::log_warn(&format!(
+                "[Codex Start] managed Store activation timed out without a stable matching PID: launch_path={} codex_home={} cleanup_pids={}",
+                package_launch_path.to_string_lossy(),
+                summarize_text_for_process_log(codex_home_trimmed, 96),
+                summarize_pid_list_for_log(&new_profile_pids)
+            ));
             let cleanup_result = close_pids(&new_profile_pids, 10);
             if let Err(error) = cleanup_result.as_ref() {
                 crate::modules::logger::log_warn(&format!(
